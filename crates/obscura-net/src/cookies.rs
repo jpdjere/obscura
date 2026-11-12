@@ -255,6 +255,15 @@ impl CookieJar {
     }
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
+        self.collect_cookies(|cookie, _| cookie)
+    }
+
+    #[doc(hidden)]
+    pub fn get_all_cookies_with_scope(&self) -> Vec<(CookieInfo, bool)> {
+        self.collect_cookies(|cookie, host_only| (cookie, host_only))
+    }
+
+    fn collect_cookies<T>(&self, mut convert: impl FnMut(CookieInfo, bool) -> T) -> Vec<T> {
         let cookies = self.read_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -266,7 +275,7 @@ impl CookieJar {
                 if entry.expires.is_some_and(|expires| expires <= now) {
                     continue;
                 }
-                result.push(CookieInfo {
+                result.push(convert(CookieInfo {
                     name: entry.name.clone(),
                     value: entry.value.clone(),
                     domain: entry.domain.clone(),
@@ -275,14 +284,14 @@ impl CookieJar {
                     http_only: entry.http_only,
                     same_site: entry.same_site.clone(),
                     expires: entry.expires.map(|e| e as i64),
-                });
+                }, entry.host_only));
             }
         }
         result
     }
 
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
-        self.set_cookies_from_import(cookies.into_iter().map(|cookie| (cookie, false)));
+        let _ = self.set_cookies_from_import(cookies.into_iter().map(|cookie| (cookie, false)), false);
     }
 
     /// Import CDP cookies while preserving whether each cookie was created
@@ -292,7 +301,16 @@ impl CookieJar {
         &self,
         cookies: impl IntoIterator<Item = (CookieInfo, bool)>,
     ) {
-        self.set_cookies_from_import(cookies);
+        let _ = self.set_cookies_from_import(cookies, false);
+    }
+
+    /// Report rejected imports. Earlier valid entries may already be applied.
+    #[doc(hidden)]
+    pub fn try_set_cookies_from_cdp_with_scope(
+        &self,
+        cookies: impl IntoIterator<Item = (CookieInfo, bool)>,
+    ) -> Result<(), String> {
+        self.set_cookies_from_import(cookies, true)
     }
 
     /// Replace this jar with an independent copy of another jar, including
@@ -305,27 +323,34 @@ impl CookieJar {
         *self.write_jar() = snapshot;
     }
 
-    fn set_cookies_from_import(&self, cookies: impl IntoIterator<Item = (CookieInfo, bool)>) {
+    fn set_cookies_from_import(
+        &self, cookies: impl IntoIterator<Item = (CookieInfo, bool)>, report_rejection: bool,
+    ) -> Result<(), String> {
         let mut jar = self.write_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         for (cookie, host_only) in cookies {
-            // RFC 6265 4.1.2.3: the leading dot is ignored. The Set-Cookie path already strips
-            // it, but this code did not, which is why one cookie became two entries.
-            let domain = canonical_domain(&cookie.domain);
-            if domain.is_empty()
-                || (is_public_suffix(&domain)
-                    && domain != "localhost"
-                    && domain.parse::<std::net::IpAddr>().is_err())
-            {
+            // An import supplies its own host. Public suffixes still cannot
+            // scope a cookie to their child sites.
+            let Some((domain, stored_host_only)) = resolve_cookie_domain(
+                &cookie.domain, (!host_only).then_some(cookie.domain.as_str()),
+            ) else {
+                if report_rejection { return Err(format!("Invalid domain for cookie '{}'", cookie.name)); }
                 continue;
-            }
-            if cookie.same_site == "None" && !cookie.secure {
+            };
+            let same_site = if cookie.same_site.is_empty() {
+                DEFAULT_SAME_SITE.to_string()
+            } else {
+                normalize_same_site(&cookie.same_site)
+            };
+            if same_site == "None" && !cookie.secure {
+                if report_rejection { return Err(format!("Cookie '{}' requires Secure for SameSite=None", cookie.name)); }
                 continue;
             }
             if !cookie_prefix_allows(&cookie.name, cookie.secure, !host_only, Some(&cookie.path)) {
+                if report_rejection { return Err(format!("Cookie '{}' violates its name prefix requirements", cookie.name)); }
                 continue;
             }
             if cookie.expires.is_some_and(|expires| {
@@ -338,18 +363,13 @@ impl CookieJar {
                 }
                 continue;
             }
-            let same_site = if cookie.same_site.is_empty() {
-                DEFAULT_SAME_SITE.to_string()
-            } else {
-                normalize_same_site(&cookie.same_site)
-            };
             let expires = cookie.expires.and_then(|e| if e > 0 { Some(e as u64) } else { None });
             let entry = CookieEntry {
                 name: cookie.name.clone(),
                 value: cookie.value,
                 path: cookie.path.clone(),
                 domain: domain.clone(),
-                host_only,
+                host_only: stored_host_only,
                 secure: cookie.secure,
                 http_only: cookie.http_only,
                 expires,
@@ -357,6 +377,7 @@ impl CookieJar {
             };
             jar.entry(domain).or_default().insert((cookie.name, cookie.path), entry);
         }
+        Ok(())
     }
 
     pub fn get_js_visible_cookies(&self, url: &Url) -> String {
@@ -612,7 +633,7 @@ impl CookieJar {
         let cookies: Vec<PersistedCookie> = serde_json::from_str(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let count = cookies.len();
-        self.set_cookies_from_import(
+        self.set_cookies_from_cdp_with_scope(
             cookies
                 .into_iter()
                 .map(|persisted| (persisted.cookie, persisted.host_only.unwrap_or(false))),
@@ -1687,6 +1708,58 @@ mod tests {
         assert!(jar
             .get_cookie_header_same_site(&Url::parse("https://sub.github.io/").unwrap())
             .is_empty());
+    }
+
+    #[test]
+    fn imported_public_suffix_cookies_are_host_only() {
+        for domain in ["httpbin.org", ".httpbin.org", "github.io", ".github.io", "com", ".com"] {
+            for host_only in [false, true] {
+                let jar = CookieJar::new();
+                jar.try_set_cookies_from_cdp_with_scope([(CookieInfo {
+                    name: "session".into(), value: "private".into(), domain: domain.into(),
+                    path: "/".into(), secure: true, http_only: true,
+                    same_site: "Lax".into(), expires: None,
+                }, host_only)]).unwrap();
+                let host = canonical_domain(domain);
+                let origin = Url::parse(&format!("https://{host}/")).unwrap();
+                let child = Url::parse(&format!("https://child.{host}/")).unwrap();
+                assert_eq!(jar.get_cookie_header_same_site(&origin), "session=private", "{domain}");
+                assert!(jar.get_cookie_header_same_site(&child).is_empty(), "{domain}");
+                assert!(jar.get_js_visible_cookies(&origin).is_empty(), "HttpOnly must survive import");
+                let exported = jar.get_all_cookies_with_scope();
+                assert_eq!(exported.len(), 1);
+                assert!(exported[0].1, "{domain}");
+            }
+        }
+    }
+
+    #[test]
+    fn imported_cookie_scope_does_not_bypass_prefix_requirements() {
+        for domain in ["httpbin.org", "example.com"] {
+            for host_only in [false, true] {
+                let jar = CookieJar::new();
+                let result = jar.try_set_cookies_from_cdp_with_scope([(CookieInfo {
+                    name: "__Host-session".into(), value: "private".into(), domain: domain.into(),
+                    path: "/".into(), secure: true, http_only: true,
+                    same_site: "Lax".into(), expires: None,
+                }, host_only)]);
+                assert_eq!(result.is_ok(), host_only, "{domain}");
+                assert_eq!(jar.get_all_cookies().len(), usize::from(host_only));
+            }
+        }
+    }
+
+    #[test]
+    fn imported_domain_cookie_still_reaches_child_hosts() {
+        let jar = CookieJar::new();
+        jar.try_set_cookies_from_cdp_with_scope([(CookieInfo {
+            name: "domain".into(), value: "shared".into(), domain: ".example.com".into(),
+            path: "/".into(), secure: true, http_only: false,
+            same_site: "Lax".into(), expires: None,
+        }, false)]).unwrap();
+        assert_eq!(jar.get_cookie_header_same_site(&Url::parse("https://child.example.com/").unwrap()),
+            "domain=shared");
+        assert!(!jar.get_all_cookies_with_scope()[0].1);
     }
 
     #[test]

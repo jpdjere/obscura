@@ -25,6 +25,12 @@ obscura --storage-dir ./obscura-data mcp
 
 The MCP server also accepts `OBSCURA_STORAGE_DIR` and flushes the profile on exit.
 
+MCP cookie domains without a leading dot are host-only. A leading dot requests
+subdomain scope, which is preserved by `browser_get_cookies` and storage-state
+export/restore. Public-suffix hosts retain cookies only for that exact host,
+never for their child sites. Rejected cookie imports return a tool error;
+earlier entries in a failed storage-state restore may already have been applied.
+
 ## Layout
 
 Inside `./obscura-data`:

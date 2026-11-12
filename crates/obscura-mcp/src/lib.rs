@@ -554,7 +554,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                     "properties": {
                         "name": { "type": "string" },
                         "value": { "type": "string" },
-                        "domain": { "type": "string", "description": "e.g. example.com or .example.com" },
+                        "domain": { "type": "string", "description": "example.com is host-only; .example.com includes subdomains" },
                         "path": { "type": "string", "description": "default '/'" },
                         "secure": { "type": "boolean" },
                         "http_only": { "type": "boolean" }
@@ -1567,10 +1567,10 @@ async fn tool_reload(state: &mut BrowserState) -> Result<String, String> {
 }
 
 fn tool_get_cookies(args: &Value, state: &BrowserState) -> Result<String, String> {
-    let domain_filter = args.get("domain").and_then(Value::as_str);
-    let cookies = state.context.cookie_jar.get_all_cookies();
+    let domain_filter = args.get("domain").and_then(Value::as_str).map(obscura_net::canonical_domain);
+    let cookies = export_cookies(state);
     let lines: Vec<String> = cookies.iter()
-        .filter(|c| domain_filter.is_none_or(|d| c.domain == obscura_net::canonical_domain(d)))
+        .filter(|c| domain_filter.as_deref().is_none_or(|d| c.domain.trim_start_matches('.') == d))
         .map(|c| serde_json::to_string(&json!({
             "name": c.name,
             "value": c.value,
@@ -1607,7 +1607,7 @@ fn tool_set_cookie(args: &Value, state: &BrowserState) -> Result<String, String>
         same_site: String::new(),
         expires: None,
     };
-    state.context.cookie_jar.set_cookies_from_cdp(vec![cookie]);
+    state.context.cookie_jar.try_set_cookies_from_cdp_with_scope([import_cookie(cookie)])?;
     Ok(format!("Set cookie {name} on {domain}{path}"))
 }
 
@@ -2326,11 +2326,24 @@ fn format_web_results(query: &str, body: &Value) -> String {
     }
 }
 
+fn export_cookies(state: &BrowserState) -> Vec<obscura_net::CookieInfo> {
+    state.context.cookie_jar.get_all_cookies_with_scope().into_iter()
+        .map(|(mut cookie, host_only)| {
+            if !host_only { cookie.domain.insert(0, '.'); }
+            cookie
+        }).collect()
+}
+
+fn import_cookie(cookie: obscura_net::CookieInfo) -> (obscura_net::CookieInfo, bool) {
+    let host_only = !cookie.domain.trim().starts_with('.');
+    (cookie, host_only)
+}
+
 /// Export full session state: cookies + localStorage + sessionStorage
 /// for every origin the page knows about. Agents stash this between
 /// runs to skip a login flow.
 fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
-    let cookies: Vec<Value> = state.context.cookie_jar.get_all_cookies().iter().map(|c| json!({
+    let cookies: Vec<Value> = export_cookies(state).iter().map(|c| json!({
         "name": c.name,
         "value": c.value,
         "domain": c.domain,
@@ -2430,7 +2443,8 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
             }
         }
     }
-    state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    state.context.cookie_jar.try_set_cookies_from_cdp_with_scope(parsed.into_iter().map(import_cookie))
+        .map_err(|error| format!("{error}; storage restoration may be partial"))?;
     state.context.save_storage();
     Ok(format!("Restored {applied} web storage entries; processed {cookie_count} cookie entries."))
 }
@@ -2727,6 +2741,74 @@ mod tests {
             assert!(state.context.local_storage.entries().is_empty(), "invalid input must be validated before writes");
             assert!(state.tabs.is_empty(), "invalid input must not create a tab");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_tools_preserve_host_only_and_domain_scope_through_restore() {
+        let mut state = BrowserState::new(None, None, false);
+        for (domain, name) in [
+            ("httpbin.org", "suffix_plain"), (".httpbin.org", "suffix_dot"),
+            ("example.com", "narrow"), (".example.com", "broad"),
+            ("example.com", "__Host-session"),
+        ] {
+            tool_set_cookie(&json!({
+                "name": name, "value": "private", "domain": domain,
+                "path": "/", "secure": true, "http_only": true,
+            }), &state).unwrap();
+        }
+        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).unwrap()).unwrap();
+        for cookie in exported["cookies"].as_array().unwrap() {
+            let expected = match cookie["name"].as_str().unwrap() {
+                "broad" => ".example.com",
+                "suffix_plain" | "suffix_dot" => "httpbin.org",
+                _ => "example.com",
+            };
+            assert_eq!(cookie["domain"], expected);
+        }
+        let listed = tool_get_cookies(&json!({"domain": ".example.com"}), &state).unwrap();
+        let listed: Vec<Value> = listed.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(listed.len(), 3);
+        let mut restored = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": exported}), &mut restored).unwrap();
+        for state in [&state, &restored] {
+            let jar = &state.context.cookie_jar;
+            let host = url::Url::parse("https://example.com/").unwrap();
+            let child = url::Url::parse("https://child.example.com/").unwrap();
+            assert_eq!(jar.get_cookie_header_same_site(&child), "broad=private");
+            let parent_cookies = jar.get_cookie_header_same_site(&host);
+            assert!(parent_cookies.contains("narrow=private"));
+            assert!(parent_cookies.contains("__Host-session=private"));
+            assert!(jar.get_js_visible_cookies(&host).is_empty());
+            assert!(jar.get_cookie_header_same_site(&url::Url::parse("https://child.httpbin.org/").unwrap()).is_empty());
+            let suffix_cookies = jar.get_cookie_header_same_site(&url::Url::parse("https://httpbin.org/").unwrap());
+            assert!(suffix_cookies.contains("suffix_plain=private"));
+            assert!(suffix_cookies.contains("suffix_dot=private"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_tools_report_rejected_imports() {
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_set_cookie(&json!({
+            "name": "__Host-session", "value": "private", "domain": ".httpbin.org",
+            "path": "/", "secure": true,
+        }), &state).unwrap_err();
+        assert!(error.contains("prefix"), "{error}");
+        let error = tool_set_storage_state(&json!({"state": {"cookies": [{
+            "name": "__Secure-session", "value": "private", "domain": "example.com",
+            "path": "/", "secure": false,
+        }], "origins": []}}), &mut state).unwrap_err();
+        assert!(error.contains("prefix") && error.contains("partial"), "{error}");
+        let error = tool_set_cookie(&json!({
+            "name": "invalid", "value": "private", "domain": "",
+        }), &state).unwrap_err();
+        assert!(error.contains("domain"), "{error}");
+        let error = tool_set_storage_state(&json!({"state": {"cookies": [{
+            "name": "invalid", "value": "private", "domain": "example.com",
+            "same_site": "none", "secure": false,
+        }]}}), &mut state).unwrap_err();
+        assert!(error.contains("SameSite=None") && error.contains("partial"), "{error}");
+        assert!(state.context.cookie_jar.get_all_cookies().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
